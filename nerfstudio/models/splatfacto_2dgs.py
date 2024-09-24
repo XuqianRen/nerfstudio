@@ -1,32 +1,20 @@
-"""
-Depth + normal splatter
-"""
-
-import math
-import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Dict, List, Optional, Type, Union
 
 import torch
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
+from gsplat.strategy import DefaultStrategy
+from pytorch_msssim import SSIM
 from torch import Tensor
 from torch.nn import Parameter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-from pytorch_msssim import SSIM
-
-from gsplat.strategy import DefaultStrategy
 
 try:
     from gsplat.rendering import rasterization_2dgs
 except ImportError:
-    print("Please install gsplat>=1.0.0")
-# from gsplat import rasterize_gaussians
-from gsplat.cuda._torch_impl import _quat_to_rotmat as quat_to_rotmat
+    print("Please install gsplat>=1.3.0")
 
-# from gsplat.cuda_legacy._wrapper import num_sh_bases
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import CameraOptimizer
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid
@@ -35,18 +23,17 @@ from nerfstudio.models.splatfacto import (
     SplatfactoModel,
     SplatfactoModelConfig,
     get_viewmat,
+    num_sh_bases,
+    random_quat_tensor,
 )
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
-from nerfstudio.models.splatfacto import random_quat_tensor, num_sh_bases
+
 
 @dataclass
 class Splatfacto2DGSModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: Splatfacto2DGSModel)
 
-    ### Splatfacto 2dgs configs ###
-    
-    """Encourage 2D Gaussians"""
     # Distortion loss. (experimental)
     dist_loss: bool = False
     # Weight for distortion loss
@@ -54,31 +41,6 @@ class Splatfacto2DGSModelConfig(SplatfactoModelConfig):
     # Iteration to start distortion loss regulerization
     dist_start_iter: int = 3_000
 
-    ### Splatfacto configs ###
-    warmup_length: int = 500
-    """period of steps where refinement is turned off"""
-    num_downscales: int = 0
-    """at the beginning, resolution is 1/2^d, where d is this number"""
-    use_scale_regularization: bool = False
-    """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 5.0
-    """threshold of ratio of gaussian max to min scale before applying regularization
-    loss from the PhysGaussian paper
-    """
-    stop_split_at: int = 15000
-    """stop splitting at this step"""
-    camera_optimizer: CameraOptimizerConfig = field(
-        default_factory=lambda: CameraOptimizerConfig(mode="off")
-    )
-    """Config of the camera optimizer to use"""
-    output_depth_during_training: bool = True
-    """If True, output depth during training. Otherwise, only output depth during evaluation."""
-
-    # pearson depth loss lambda
-    pearson_lambda: float = 0
-    """Regularizer for pearson depth loss"""
-
-    # Model for 2dgs.
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.01
     # GSs with image plane gradient above this value will be split/duplicated
@@ -93,7 +55,7 @@ class Splatfacto2DGSModelConfig(SplatfactoModelConfig):
     # Stop refining GSs after this iteration
     refine_stop_iter: int = 15_000
     # Reset opacities every this steps
-    reset_every: int = 3000  # 3000
+    reset_every: int = 3000
     # Refine GSs every this steps
     refine_every: int = 100
     # Use absolute gradient for pruning. This typically requires larger --grow_grad2d, e.g., 0.0008 or 0.0006
@@ -103,15 +65,16 @@ class Splatfacto2DGSModelConfig(SplatfactoModelConfig):
 
 
 class Splatfacto2DGSModel(SplatfactoModel):
-    """Depth + Normal splatter"""
-
     config: Splatfacto2DGSModelConfig
 
     def populate_modules(self):
         if self.seed_points is not None and not self.config.random_init:
             means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
         else:
-            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+            means = torch.nn.Parameter(
+                (torch.rand((self.config.num_random, 3)) - 0.5)
+                * self.config.random_scale
+            )
         distances, _ = self.k_nearest_sklearn(means.data, 3)
         distances = torch.from_numpy(distances)
         # find the average of the three nearest neighbors for each point and use that as the scale
@@ -154,10 +117,6 @@ class Splatfacto2DGSModel(SplatfactoModel):
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
-        # metrics
-        from torchmetrics.image import PeakSignalNoiseRatio
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
@@ -177,7 +136,7 @@ class Splatfacto2DGSModel(SplatfactoModel):
                 grid_Y=self.config.grid_shape[1],
                 grid_W=self.config.grid_shape[2],
             )
-        
+
         # Densification Strategy
         self.strategy = DefaultStrategy(
             verbose=True,
@@ -194,25 +153,25 @@ class Splatfacto2DGSModel(SplatfactoModel):
             revised_opacity=False,
             key_for_gradient="gradient_2dgs",
         )
-        
-        self.strategy_state = self.strategy.initialize_state()
 
+        self.strategy_state = self.strategy.initialize_state()
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
 
-            return {
-                name: [self.gauss_params[name]]
-                for name in [
-                    "means",
-                    "scales",
-                    "quats",
-                    "features_dc",
-                    "features_rest",
-                    "opacities",
-                ]
-            }
+        return {
+            name: [self.gauss_params[name]]
+            for name in [
+                "means",
+                "scales",
+                "quats",
+                "features_dc",
+                "features_rest",
+                "opacities",
+            ]
+        }
+
     def get_outputs(
         self, camera: Cameras
     ) -> Dict[str, Union[torch.Tensor, List[Tensor]]]:
@@ -235,7 +194,6 @@ class Splatfacto2DGSModel(SplatfactoModel):
             optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
         else:
             optimized_camera_to_world = camera.camera_to_worlds
-
 
         # cropping
         if self.crop_box is not None and not self.training:
@@ -268,9 +226,6 @@ class Splatfacto2DGSModel(SplatfactoModel):
             (features_dc_crop[:, None, :], features_rest_crop), dim=1
         )
 
-        BLOCK_WIDTH = (
-            16  # this controls the tile size of rasterization, 16 is a good default
-        )
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
         viewmat = get_viewmat(optimized_camera_to_world)
@@ -292,7 +247,6 @@ class Splatfacto2DGSModel(SplatfactoModel):
         else:
             colors_crop = torch.sigmoid(colors_crop)
             sh_degree_to_use = None
-
 
         kwargs = {
             "near_plane": 0.2,
@@ -338,11 +292,10 @@ class Splatfacto2DGSModel(SplatfactoModel):
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         depth_im = render_colors[..., 3:4]
-        depth_im = torch.where(
-            alpha > 0, depth_im, depth_im.detach().max()
-        ).squeeze(0)
+        depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
 
         normals_im = render_normals[0]  # [-1,1]
+
         # convert normals from [-1,1] to [0,1]
         normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
         normals_im = (normals_im + 1) / 2
@@ -376,9 +329,4 @@ class Splatfacto2DGSModel(SplatfactoModel):
         main_loss = loss_dict["main_loss"]
         scale_reg = loss_dict["scale_reg"]
 
-
         return {"main_loss": main_loss, "scale_reg": scale_reg}
-
-    
-
-
